@@ -222,7 +222,23 @@ def read_bridge_records():
         with urllib.request.urlopen(req, timeout=5) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
         messages = payload.get("messages")
-        return messages if isinstance(messages, list) else None
+        if not isinstance(messages, list):
+            return None
+        # Sheets returns phone numbers as JSON numbers, not strings.
+        # html.escape() and the inbox grouping need strings, so coerce
+        # the fields the inbox uses. (Found live 12 Nov: /inbox 502'd
+        # because from_number arrived as int 6588198484.)
+        for msg in messages:
+            if isinstance(msg, dict):
+                for key in ("from_number", "to_number", "message_id",
+                            "type", "text", "media_id", "tally_status",
+                            "received_at_utc", "whatsapp_timestamp"):
+                    if key in msg and msg[key] is not None:
+                        msg[key] = str(msg[key])
+                if "extracted_amount_hint_sgd" in msg \
+                        and msg["extracted_amount_hint_sgd"] == "":
+                    msg["extracted_amount_hint_sgd"] = None
+        return messages
     except Exception as exc:
         _log_error("bridge read failed (%s); falling back to local file" % exc)
         return None
@@ -299,8 +315,8 @@ def _counterpart(record):
     """The other party in a conversation: sender for inbound, recipient
     for outbound."""
     if record.get("direction") == "out":
-        return record.get("to_number") or ""
-    return record.get("from_number") or ""
+        return str(record.get("to_number") or "")
+    return str(record.get("from_number") or "")
 
 
 def render_inbox(records):
