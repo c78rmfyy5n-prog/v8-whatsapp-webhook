@@ -3,9 +3,11 @@
 WhatsApp Business Cloud API webhook receiver + inbox — v2 for V8 Car Rentals.
 
 v2 = v1 (webhook receive + store) PLUS:
-  * GET  /inbox        — mobile-friendly HTML inbox, messages grouped by
-                          sender/recipient number, newest first, with a
-                          reply box per conversation.
+  * GET  /inbox        — WhatsApp-Web style inbox: chat list on the
+                          left, one open conversation on the right,
+                          photos shown inline, short Singapore times.
+  * GET  /media/<id>   — serves one photo/media item from Meta (the
+                          inbox <img> source; needs the inbox token).
   * GET  /api/messages — JSON list of stored messages, newest first.
   * POST /send         — JSON {"to": "<e164 without +>", "text": "..."}
                           sends a WhatsApp text via the Graph API and
@@ -116,7 +118,8 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
+from zoneinfo import ZoneInfo
 
 VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "")
 APP_SECRET = os.environ.get("WHATSAPP_APP_SECRET", "")
@@ -264,8 +267,10 @@ def flatten_messages(payload):
                 media_id = None
                 if msg_type == "text":
                     text = msg.get("text", {}).get("body", "")
-                elif msg_type in ("image", "document"):
+                elif msg_type in ("image", "video", "document"):
                     text = msg.get(msg_type, {}).get("caption", "")
+                    media_id = msg.get(msg_type, {}).get("id")
+                elif msg_type in ("audio", "sticker"):
                     media_id = msg.get(msg_type, {}).get("id")
                 yield {
                     "received_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -319,64 +324,233 @@ def _counterpart(record):
     return str(record.get("from_number") or "")
 
 
-def render_inbox(records):
-    """Simple mobile-friendly inbox HTML, grouped by counterpart."""
+SGT = ZoneInfo("Asia/Singapore")
+
+_DATE_TEXT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T00:00:00(\.\d+)?Z$")
+_URL_RE = re.compile(r"https?://[^\s<]+")
+
+
+def _fmt_time(iso_str):
+    """Short Singapore time for the inbox, e.g. '15 Nov, 5:52pm'."""
+    raw = str(iso_str or "")
+    if not raw:
+        return ""
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return raw[:16]
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(SGT).strftime("%d %b, %-I:%M%p").replace(
+        "PM", "pm").replace("AM", "am")
+
+
+def _display_text(rec):
+    """Message text as shown in the inbox.
+
+    The Sheets bridge returns date-parsed cells as Date objects, so a
+    message whose text was a plain date (e.g. '15 Nov 2026') comes back
+    as '2026-11-15T00:00:00.000Z'. Show it as the date again.
+    """
+    text = str(rec.get("text") or "")
+    if _DATE_TEXT_RE.match(text):
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            return dt.astimezone(SGT).strftime("%d %b %Y")
+        except ValueError:
+            return text
+    return text
+
+
+def _linkify(escaped):
+    """Make http(s) URLs in already-escaped text clickable."""
+    return _URL_RE.sub(
+        lambda m: "<a href='" + m.group(0) + "' target='_blank'>"
+                  + m.group(0) + "</a>",
+        escaped)
+
+
+def _msg_preview(rec):
+    """One-line preview for the chat list."""
+    msg_type = str(rec.get("type") or "")
+    text = _display_text(rec)
+    if msg_type == "image":
+        return ("[Photo] " + text).strip() if text else "[Photo]"
+    labels = {"video": "[Video]", "audio": "[Voice message]",
+              "document": "[Document]", "sticker": "[Sticker]"}
+    if msg_type in labels:
+        return (labels[msg_type] + " " + text).strip() if text else labels[msg_type]
+    return text
+
+
+def _msg_body_html(rec, token):
+    """One message's content: photo (if any) plus text, linkified."""
+    msg_type = str(rec.get("type") or "")
+    media_id = str(rec.get("media_id") or "")
+    text = _linkify(html.escape(_display_text(rec)))
+    if msg_type == "image" and media_id:
+        img = ("<img src='/media/" + quote(media_id, safe="") + "?token="
+               + quote(token, safe="") + "' alt='Photo' "
+               "style='max-width:100%;border-radius:8px;display:block;"
+               "margin-bottom:4px'>")
+        return img + text if text else img
+    labels = {"video": "[Video]", "audio": "[Voice message]",
+              "document": "[Document]", "sticker": "[Sticker]"}
+    if msg_type in labels:
+        label = "<i>" + labels[msg_type] + "</i>"
+        return (label + "<br>" + text) if text else label
+    return text
+
+
+def fetch_media_bytes(media_id):
+    """Download one media item from Meta. Returns (status, content_type, data)."""
+    if not ACCESS_TOKEN:
+        return 500, "text/plain", b"WHATSAPP_ACCESS_TOKEN is not set"
+    info_url = "https://graph.facebook.com/%s/%s" % (GRAPH_VERSION, media_id)
+    req = urllib.request.Request(info_url)
+    req.add_header("Authorization", "Bearer " + ACCESS_TOKEN)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            info = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return 502, "text/plain", (
+            "Meta media lookup failed (HTTP %s)" % exc.code).encode()
+    except Exception as exc:
+        return 502, "text/plain", (
+            "Meta media lookup failed: %s" % exc).encode()
+    media_url = info.get("url", "")
+    mime_type = info.get("mime_type", "") or "application/octet-stream"
+    if not media_url:
+        return 502, "text/plain", b"Meta returned no download URL for this media"
+    req = urllib.request.Request(media_url)
+    req.add_header("Authorization", "Bearer " + ACCESS_TOKEN)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = resp.read()
+            ctype = resp.headers.get_content_type() or mime_type
+            return 200, ctype, data
+    except urllib.error.HTTPError as exc:
+        return 502, "text/plain", (
+            "Media download failed (HTTP %s)" % exc.code).encode()
+    except Exception as exc:
+        return 502, "text/plain", (
+            "Media download failed: %s" % exc).encode()
+
+
+def render_inbox(records, token="", selected=""):
+    """WhatsApp-Web style inbox: chat list left, one open chat right.
+
+    Photos sent by drivers show inline (fetched from Meta via
+    /media/<id>). Times are short Singapore times. Only the selected
+    conversation is shown in full, so the page stays tidy with many chats.
+    """
     groups = {}
     for rec in records:
         groups.setdefault(_counterpart(rec), []).append(rec)
-    # Newest conversation first (by its latest message).
     ordered = sorted(
         groups.items(),
         key=lambda kv: max((r.get("received_at_utc") or "" for r in kv[1]),
                            default=""),
         reverse=True)
+    chat_open = selected in groups
+    if not chat_open:
+        selected = ordered[0][0] if ordered else ""
+    tok = ("?token=" + quote(token, safe="")) if token else ""
+
+    def chat_href(number):
+        sep = "&chat=" if tok else "?chat="
+        return "/inbox" + tok + sep + quote(number, safe="")
+
     parts = [
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
         "<title>V8 Car Rentals — WhatsApp Inbox</title>"
-        "<style>body{font-family:system-ui,sans-serif;margin:16px;max-width:720px}"
-        ".conv{border:1px solid #ccc;border-radius:8px;padding:12px;margin:12px 0}"
-        ".msg{margin:6px 0}.in{color:#111}.out{color:#0a5;text-align:right}"
-        "form{display:flex;gap:6px;margin-top:8px}"
-        "input[type=text]{flex:1;padding:8px}button{padding:8px 12px}"
-        "small{color:#666}</style></head><body>"
-        "<h1>V8 Car Rentals — WhatsApp Inbox</h1>"
-        "<p><small>Messages are stored permanently in Google Sheets "
-        "(via the bridge) and locally as a fallback. Replying sends "
-        "from +65 9725 0880.</small></p>",
+        "<style>"
+        "body{font-family:system-ui,sans-serif;margin:0;background:#f0f2f5;color:#111}"
+        "header{padding:12px 16px;background:#fff;border-bottom:1px solid #ddd}"
+        "header h1{font-size:18px;margin:0}header small{color:#666}"
+        ".wrap{display:flex;max-width:1100px;margin:0 auto;align-items:stretch}"
+        ".list{width:300px;flex:none;background:#fff;border-right:1px solid #ddd}"
+        ".list a{display:block;padding:12px 14px;border-bottom:1px solid #eee;text-decoration:none;color:#111}"
+        ".list a.sel{background:#e9edef}"
+        ".list .num{font-weight:600}.list .when{float:right;color:#888;font-size:12px}"
+        ".list .prev{color:#666;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}"
+        ".chat{flex:1;min-width:0;display:flex;flex-direction:column;background:#efeae2}"
+        ".chathead{padding:12px 16px;background:#fff;border-bottom:1px solid #ddd}"
+        ".chathead b{font-size:17px}.chathead small{color:#666}"
+        ".chatlog{flex:1;overflow-y:auto;padding:16px;max-height:calc(100vh - 190px)}"
+        ".bubble{max-width:75%;padding:8px 12px;border-radius:10px;margin:6px 0;word-wrap:break-word}"
+        ".bubble.in{background:#fff;margin-right:auto}"
+        ".bubble.out{background:#d9fdd3;margin-left:auto}"
+        ".bubble .t{font-size:11px;color:#888;text-align:right;margin-top:2px}"
+        ".reply{display:flex;gap:8px;padding:12px;background:#fff;border-top:1px solid #ddd}"
+        ".reply input{flex:1;padding:10px;border:1px solid #ccc;border-radius:8px}"
+        ".reply button{padding:10px 16px;background:#00a884;color:#fff;border:0;border-radius:8px;cursor:pointer}"
+        ".reply button:disabled{opacity:.5;cursor:default}"
+        ".back{display:none}"
+        "@media (max-width:720px){"
+        ".wrap{display:block}.list{width:auto;border-right:0}"
+        ".chat{display:none}.chatlog{max-height:none}"
+        "body.chat-open .chat{display:flex}body.chat-open .list{display:none}"
+        "body.chat-open .back{display:inline}"
+        "}"
+        "</style></head>"
+        "<body" + (" class='chat-open'" if chat_open else "") + ">"
+        "<header><h1>V8 Car Rentals — WhatsApp Inbox</h1>"
+        "<small>Replying sends from +65 9725 0880. Messages are stored "
+        "permanently in Google Sheets.</small></header>"
+        "<div class='wrap'>",
     ]
     if not ordered:
-        parts.append("<p>No messages yet.</p>")
-    for number, msgs in ordered:
-        msgs_sorted = sorted(msgs, key=lambda r: r.get("received_at_utc") or "")
-        parts.append("<div class='conv'><h2>%s</h2>" % html.escape(number or "?"))
-        for rec in msgs_sorted:
-            cls = "out" if rec.get("direction") == "out" else "in"
-            who = "You" if cls == "out" else html.escape(number or "?")
+        parts.append("<div class='list'><p style='padding:14px'>No messages yet.</p></div>")
+    else:
+        parts.append("<div class='list'>")
+        for number, msgs in ordered:
+            last = max(msgs, key=lambda r: r.get("received_at_utc") or "")
+            prev = _msg_preview(last)
+            if len(prev) > 60:
+                prev = prev[:57] + "..."
+            cls = " class='sel'" if number == selected else ""
             parts.append(
-                "<div class='msg %s'><b>%s</b> "
-                "<small>%s</small><br>%s</div>" % (
-                    cls, who,
-                    html.escape(str(rec.get("received_at_utc") or "")),
-                    html.escape(str(rec.get("text") or ""))))
+                "<a href='" + chat_href(number) + "'" + cls + ">"
+                "<span class='when'>" + html.escape(_fmt_time(last.get("received_at_utc"))) + "</span>"
+                "<span class='num'>" + html.escape(number or "?") + "</span>"
+                "<div class='prev'>" + html.escape(prev) + "</div></a>")
+        parts.append("</div>")
+    if selected:
+        msgs = sorted(groups[selected],
+                      key=lambda r: r.get("received_at_utc") or "")
+        parts.append("<div class='chat'>")
         parts.append(
-            "<form method='post' action='/send' data-to='%s'>"
+            "<div class='chathead'><a class='back' href='/inbox" + tok + "'>&larr; All chats</a> "
+            "<b>" + html.escape(selected) + "</b><br>"
+            "<small>Replying sends from +65 9725 0880.</small></div>")
+        parts.append("<div class='chatlog' id='chatlog'>")
+        for rec in msgs:
+            cls = "out" if rec.get("direction") == "out" else "in"
+            parts.append(
+                "<div class='bubble " + cls + "'>"
+                + _msg_body_html(rec, token)
+                + "<div class='t'>" + html.escape(_fmt_time(rec.get("received_at_utc"))) + "</div></div>")
+        parts.append("</div>")
+        parts.append(
+            "<form class='reply' id='replyform' method='post' action='/send' data-to='" + html.escape(selected, quote=True) + "'>"
             "<input type='text' name='text' placeholder='Reply…' required>"
             "<button type='submit'>Send</button></form>"
-            "<script>document.querySelectorAll('form[data-to]').forEach(f=>{"
-            "f.addEventListener('submit',async e=>{e.preventDefault();"
-            "const b=f.querySelector('button');if(b.disabled)return;b.disabled=true;"
-            "const t=f.querySelector('input').value;"
-            "const tk=new URLSearchParams(location.search).get('token')||'';"
-            "const r=await fetch('/send'+(tk?'?token='+encodeURIComponent(tk):''),{method:'POST',"
+            "<script>var cl=document.getElementById('chatlog');if(cl){cl.scrollTop=cl.scrollHeight}"
+            "var f=document.getElementById('replyform');"
+            "if(f){f.addEventListener('submit',async e=>{e.preventDefault();"
+            "var b=f.querySelector('button');if(b.disabled)return;b.disabled=true;"
+            "var t=f.querySelector('input').value;"
+            "var tk=new URLSearchParams(location.search).get('token')||'';"
+            "var r=await fetch('/send'+(tk?'?token='+encodeURIComponent(tk):''),{method:'POST',"
             "headers:{'Content-Type':'application/json'},"
             "body:JSON.stringify({to:f.dataset.to,text:t})});"
-            "if(r.ok){location.reload()}else{b.disabled=false;alert('Send failed: '+await r.text())}})"
-            "})</script>" % html.escape(number or ""))
+            "if(r.ok){location.reload()}else{b.disabled=false;alert('Send failed: '+await r.text())}})}"
+            "</script>")
         parts.append("</div>")
-    parts.append("</body></html>")
+    parts.append("</div></body></html>")
     return "".join(parts)
-
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # keep stdout clean
@@ -418,6 +592,17 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(403, "Verification failed: check WHATSAPP_VERIFY_TOKEN.\n")
             return
+        if parsed.path.startswith("/media/"):
+            if not self._inbox_authorised(parsed):
+                self._send(403, "Forbidden: inbox token required.\n")
+                return
+            media_id = parsed.path[len("/media/"):].split("/")[0]
+            status, ctype, data = fetch_media_bytes(media_id)
+            if status != 200:
+                self._send(status, data.decode("utf-8", "replace"))
+                return
+            self._send(status, data, ctype)
+            return
         if parsed.path in ("/inbox", "/api/messages"):
             if not self._inbox_authorised(parsed):
                 self._send(403, "Forbidden: inbox token required.\n")
@@ -429,7 +614,11 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/messages":
                 self._send_json(200, {"messages": records})
             else:
-                self._send(200, render_inbox(records), "text/html")
+                qs = parse_qs(parsed.query)
+                self._send(200, render_inbox(
+                    records,
+                    token=qs.get("token", [""])[0],
+                    selected=qs.get("chat", [""])[0]), "text/html")
             return
         self._send(404, "Not found.\n")
 
