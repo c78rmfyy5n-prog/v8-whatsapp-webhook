@@ -365,12 +365,13 @@ def render_inbox(records):
             "<button type='submit'>Send</button></form>"
             "<script>document.querySelectorAll('form[data-to]').forEach(f=>{"
             "f.addEventListener('submit',async e=>{e.preventDefault();"
+            "const b=f.querySelector('button');if(b.disabled)return;b.disabled=true;"
             "const t=f.querySelector('input').value;"
             "const tk=new URLSearchParams(location.search).get('token')||'';"
             "const r=await fetch('/send'+(tk?'?token='+encodeURIComponent(tk):''),{method:'POST',"
             "headers:{'Content-Type':'application/json'},"
             "body:JSON.stringify({to:f.dataset.to,text:t})});"
-            "if(r.ok){location.reload()}else{alert('Send failed: '+await r.text())}})"
+            "if(r.ok){location.reload()}else{b.disabled=false;alert('Send failed: '+await r.text())}})"
             "})</script>" % html.escape(number or ""))
         parts.append("</div>")
     parts.append("</body></html>")
