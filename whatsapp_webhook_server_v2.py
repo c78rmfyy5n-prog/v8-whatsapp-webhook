@@ -327,8 +327,13 @@ def send_whatsapp_text(to_number, text):
 
 
 def send_whatsapp_template(to_number, template_name, parameters,
-                           language="en_US"):
+                           language="en"):
     """Send one approved template via the Graph API.
+
+    Default language is "en": the three templates were created in
+    plain English ("en"), NOT en_US — test sends 19 Nov 2026 proved
+    en_US and en_GB both fail with Meta error 132001, while "en"
+    delivers.
 
     parameters is the ordered list of body parameter strings, e.g.
     ["Kai Seng", "420", "SLJ6993A"] for v8_rent_reminder_monday, or
@@ -704,7 +709,7 @@ class Handler(BaseHTTPRequestHandler):
             to_number = str(data.get("to", "")).strip().lstrip("+")
             template_name = str(data.get("template", "")).strip()
             parameters = data.get("parameters", [])
-            language = str(data.get("language", "en_US")).strip() or "en_US"
+            language = str(data.get("language", "en")).strip() or "en"
             if not to_number or not template_name \
                     or not isinstance(parameters, list):
                 self._send_json(400, {"error": "'to', 'template' and "
