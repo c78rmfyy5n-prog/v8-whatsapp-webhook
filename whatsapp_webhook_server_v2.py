@@ -12,6 +12,16 @@ v2 = v1 (webhook receive + store) PLUS:
   * POST /send         — JSON {"to": "<e164 without +>", "text": "..."}
                           sends a WhatsApp text via the Graph API and
                           stores the outgoing message (direction="out").
+  * POST /send_template — JSON {"to": "<e164 without +>",
+                          "template": "v8_rent_reminder_monday",
+                          "parameters": ["Kai Seng", "420", "SLJ6993A"]}
+                          sends an approved Meta template via the Graph
+                          API (added 18 Nov 2026 for the Mon 23 Nov
+                          first send). Same inbox-token auth as /send.
+                          The template name must already be APPROVED in
+                          WhatsApp Manager; if it is still In review or
+                          rejected, Meta returns an error and nothing
+                          is sent or recorded.
 
 v1 behaviour preserved exactly: GET /webhook verification challenge,
 X-Hub-Signature-256 check (when WHATSAPP_APP_SECRET is set), the same
@@ -299,6 +309,50 @@ def send_whatsapp_text(to_number, text):
         "to": to_number,
         "type": "text",
         "text": {"preview_url": False, "body": text},
+    }).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", "Bearer " + ACCESS_TOKEN)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            payload = {"error": {"message": "Graph API HTTP %s" % exc.code}}
+        return exc.code, payload
+    except Exception as exc:
+        return 502, {"error": {"message": "send failed: %s" % exc}}
+
+
+def send_whatsapp_template(to_number, template_name, parameters,
+                           language="en_US"):
+    """Send one approved template via the Graph API.
+
+    parameters is the ordered list of body parameter strings, e.g.
+    ["Kai Seng", "420", "SLJ6993A"] for v8_rent_reminder_monday, or
+    ["441", "SLZ1438K", "16 - 22 Nov 2026"] for
+    v8_payment_confirmation (amount {{1}}, plate {{2}}, dates {{3}} —
+    Meta renumbered template 3 on submission, no name variable).
+    Returns (status_code, payload).
+    """
+    url = "https://graph.facebook.com/%s/%s/messages" % (
+        GRAPH_VERSION, PHONE_NUMBER_ID)
+    body = json.dumps({
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to_number,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": language},
+            "components": [{
+                "type": "body",
+                "parameters": [{"type": "text", "text": str(p)}
+                               for p in parameters],
+            }],
+        },
     }).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", "application/json")
@@ -633,6 +687,58 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/send_template":
+            if not self._inbox_authorised(parsed):
+                self._send_json(403, {"error": "forbidden: inbox token required"})
+                return
+            if not ACCESS_TOKEN or not PHONE_NUMBER_ID:
+                self._send_json(
+                    500, {"error": "WHATSAPP_ACCESS_TOKEN and "
+                                   "WHATSAPP_PHONE_NUMBER_ID are not set"})
+                return
+            try:
+                data = self._read_json_body()
+            except ValueError:
+                self._send_json(400, {"error": "invalid JSON body"})
+                return
+            to_number = str(data.get("to", "")).strip().lstrip("+")
+            template_name = str(data.get("template", "")).strip()
+            parameters = data.get("parameters", [])
+            language = str(data.get("language", "en_US")).strip() or "en_US"
+            if not to_number or not template_name \
+                    or not isinstance(parameters, list):
+                self._send_json(400, {"error": "'to', 'template' and "
+                                         "'parameters' (a list) are required"})
+                return
+            status, payload = send_whatsapp_template(
+                to_number, template_name, parameters, language)
+            if status != 200:
+                _log_error("Graph API template send failed: %s" % payload)
+                self._send_json(status, payload)
+                return
+            meta_id = ""
+            try:
+                meta_id = payload.get("messages", [{}])[0].get("id", "")
+            except Exception:
+                meta_id = ""
+            record = {
+                "received_at_utc": datetime.now(timezone.utc).isoformat(),
+                "direction": "out",
+                "from_number": BUSINESS_NUMBER,
+                "to_number": to_number,
+                "message_id": meta_id,
+                "whatsapp_timestamp": str(int(datetime.now(timezone.utc).timestamp())),
+                "type": "template",
+                "text": "[%s] %s" % (template_name, " | ".join(
+                    str(p) for p in parameters)),
+                "media_id": None,
+                "extracted_amount_hint_sgd": None,
+                "tally_status": "template_sent",
+            }
+            store_record(record)
+            self._send_json(200, {"message_id": meta_id, "to": to_number,
+                                  "template": template_name})
+            return
         if parsed.path == "/send":
             if not self._inbox_authorised(parsed):
                 self._send_json(403, {"error": "forbidden: inbox token required"})
